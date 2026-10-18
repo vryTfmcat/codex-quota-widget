@@ -57,12 +57,54 @@ def iso_time(value):
         return None
 
 
+def tibo_notice(data, now):
+    """Prefer an announced schedule over a speculative observation."""
+    candidates = []
+    latest_at = iso_time((data.get('latest') or {}).get('announced_at'))
+    for kind, field in (('scheduled', 'scheduled_for'), ('watch', 'expires_at')):
+        item = data.get(kind)
+        if not isinstance(item, dict):
+            continue
+        deadline = iso_time(item.get(field))
+        if deadline is None or not math.isfinite(deadline):
+            continue
+        announced = iso_time(item.get('announced_at'))
+        if latest_at and announced and latest_at > announced:
+            continue  # A subsequent completed reset supersedes this prediction.
+        candidates.append(dict(item, kind=kind, deadline=deadline, active=deadline > now))
+    return next((item for item in candidates if item['active']), candidates[0] if candidates else None)
+
+
+def notice_signature(notice):
+    return '|'.join(str(notice.get(key) or '') for key in ('kind', 'tweet_id', 'deadline')) if notice else ''
+
+
+def five_idle(window):
+    # This is a display policy requested by the user, not proof about backend timing.
+    return window.get('windowDurationMins') == 300 and window.get('usedPercent') == 0
+
+
+def five_summary(five, now):
+    left = max(0, 100-five['usedPercent'])
+    if five_idle(five):
+        return '5h 剩 100%   尚未开始使用'
+    sec = max(0, int((five.get('resetsAt') or now)-now))
+    countdown = f'{sec//3600:02}:{sec%3600//60:02}:{sec%60:02}'
+    return f'5h 剩 {left:g}%   {countdown}' if sec else f'5h 上次剩 {left:g}%   待核对重置'
+
+
 def forecast(windows, now, deadline=None):
     five = next((w for w in windows if w.get('windowDurationMins') == 300), None)
     week = next((w for w in windows if w.get('windowDurationMins') == 10080), None)
-    if not five or not week or not five.get('resetsAt') or five['resetsAt'] <= now:
+    if not five or not week:
         return None
     remaining = max(0, 100-week['usedPercent'])
+    if five_idle(five):
+        return {'idle': True, 'remaining': remaining, 'current_capacity': WEEKLY_PER_WINDOW,
+                'earliest': now, 'finish_by': now, 'slots': [], 'next_reset': None,
+                'week_reset': week.get('resetsAt'), 'points': [(now, remaining)], 'at_deadline': None}
+    if not five.get('resetsAt') or five['resetsAt'] <= now:
+        return None
     current = WEEKLY_PER_WINDOW * max(0, 100-five['usedPercent']) / 100
     rest = max(0, remaining-current)
     windows_needed = math.ceil(max(0, rest-1e-9)/WEEKLY_PER_WINDOW)
@@ -79,12 +121,47 @@ def forecast(windows, now, deadline=None):
         slots.append({'start': start, 'end': when, 'after': left})
     by_deadline = None
     if deadline and deadline >= now:
-        count = max(0, math.floor((deadline-five['resetsAt'])/18000)+1)
+        # A window opening exactly at the deadline has no time before it.
+        count = max(0, math.ceil((deadline-five['resetsAt'])/18000))
         by_deadline = max(0, remaining-current-WEEKLY_PER_WINDOW*count)
     return {'remaining': remaining, 'current_capacity': current, 'earliest': earliest,
             'finish_by': slots[-1]['end'], 'slots': slots,
             'next_reset': five['resetsAt'], 'week_reset': week.get('resetsAt'),
             'points': points, 'at_deadline': by_deadline}
+
+
+def timeline_layout(f, now, deadline=None):
+    """One linear scale for both the graph and every window card."""
+    start = now-18000
+    current_start = now if f.get('idle') else f['next_reset']-18000
+    slots = [dict(slot) for slot in f['slots']]
+    if slots:
+        slots[0]['start'] = current_start
+    end = max(f['finish_by'], deadline or 0, now+60)
+    top, scale = 54, 150/18000
+    y = lambda when: top+(when-start)*scale
+    return {'start': start, 'end': end, 'current_start': current_start,
+            'slots': slots, 'top': top, 'bottom': y(end), 'now_y': y(now),
+            'height': math.ceil(y(end)+76), 'y': y}
+
+
+def visible_theory_points(theory, start, end):
+    """Clip the reference curve, never drawing before its recorded baseline."""
+    begin=max(start,theory['points'][0][0])
+    if begin>end:
+        return []
+    remaining=theory['remaining']
+    for when,value in theory['points']:
+        if when<=begin:
+            remaining=value
+    result=[(begin,remaining)]
+    for when,value in theory['points']:
+        if begin<when<=end:
+            result.append((when,value))
+            remaining=value
+    if result[-1][0]<end:
+        result.append((end,remaining))
+    return result
 
 
 def stamp(t, fmt='%m-%d %H:%M:%S'):
@@ -230,6 +307,8 @@ def due_alerts(now, state):
     alerts = []
     fired = state.setdefault('reset_fired', [])
     for w in state.get('pending_windows', []):
+        if five_idle(w):
+            continue
         reset = w.get('resetsAt')
         key = window_key(w)
         if reset and now >= reset and key not in fired:
@@ -497,8 +576,8 @@ class Widget:
         threading.Thread(target=play, daemon=True).start()
 
     def open_tibo(self):
-        watch = self.tibo.get('watch') or {}
-        url = watch.get('tweet_url') or (self.tibo.get('latest') or {}).get('tweet_url')
+        notice = tibo_notice(self.tibo, time.time()) or {}
+        url = notice.get('tweet_url') or (self.tibo.get('latest') or {}).get('tweet_url')
         if isinstance(url, str) and url.startswith('https://x.com/'):
             webbrowser.open(url)
 
@@ -564,18 +643,22 @@ class Widget:
                                               if getattr(failure,'sqlite_errorcode',None)==8 else type(failure).__name__)
                 for message in quota_alerts(data['windows'], self.state):
                     self.alert(message)
-                self.state['pending_windows'] = [w for w in data['windows'] if w.get('resetsAt') and w['windowDurationMins'] in (300, 10080)]
+                self.state['pending_windows'] = [w for w in data['windows'] if w.get('resetsAt') and w['windowDurationMins'] in (300, 10080) and not five_idle(w)]
             if name == 'tibo':
                 latest = data['latest']
                 # First fetch establishes a baseline; old announcements do not ring.
                 if tibo_changed(latest, self.state):
                     self.alert('Tibo 新重置公告：\n'+latest.get('display_text', latest.get('text', ''))[:500])
-                watch = data.get('watch') or {}
-                signature = '|'.join(str(watch.get(k) or '') for k in ('tweet_id', 'expires_at', 'level'))
-                previous_watch = self.state.get('watch_seen')
-                if previous_watch and signature != previous_watch and watch.get('tweet_id'):
-                    self.alert('Tibo 有新的重置预告线索（尚未确认）：\n'+watch.get('display_text', watch.get('text', ''))[:400])
-                self.state['watch_seen'] = signature
+                notice = tibo_notice(data, time.time())
+                signature = notice_signature(notice)
+                previous = self.state.get('tibo_notice_seen')
+                if previous is None:
+                    previous = notice_signature(tibo_notice(self.tibo, time.time()))
+                if (self.tibo.get('at') or 'tibo_notice_seen' in self.state) and signature != previous and notice and notice['active']:
+                    label = '已安排重置' if notice['kind'] == 'scheduled' else '预告观察'
+                    self.alert(f"Tibo {label}：{stamp(notice['deadline'])} 前（上限，可能更早）\n"+
+                               notice.get('display_text', notice.get('text', ''))[:400])
+                self.state['tibo_notice_seen'] = signature
                 self.tibo = {'latest': latest, 'at': data['at'], 'watch': data.get('watch'), 'scheduled': data.get('scheduled')}
                 self.state['tibo'] = self.tibo
         self.persist()
@@ -595,10 +678,7 @@ class Widget:
         self.refresh_button.config(text='刷新中…' if 'quota' in self.busy else '刷新',
                                    state='disabled' if 'quota' in self.busy else 'normal')
         if five:
-            left = max(0, 100-five['usedPercent'])
-            sec = max(0, int((five.get('resetsAt') or now)-now))
-            countdown = f'{sec//3600:02}:{sec%3600//60:02}:{sec%60:02}'
-            short = f'5h 剩 {left:g}%   {countdown}' if sec else f'5h 上次剩 {left:g}%   待核对重置'
+            short = five_summary(five, now)
             if week:
                 short += f"   周剩 {max(0,100-week['usedPercent']):g}%"
             self.main.config(text=short + ('  · 旧数据' if stale else '  · 刷新失败' if failed else ''), fg=MUTED if stale else FG)
@@ -607,29 +687,29 @@ class Widget:
         detail = []
         for w in windows:
             label = '5 小时' if w['windowDurationMins'] == 300 else '每周' if w['windowDurationMins'] == 10080 else f"{w['windowDurationMins']} 分钟"
-            detail.append(f"{label}：剩余 {max(0,100-w['usedPercent']):g}% · 重置 {stamp(w.get('resetsAt'))}")
+            detail.append(f'{label}：剩余 100% · 尚未开始使用' if five_idle(w) else
+                          f"{label}：剩余 {max(0,100-w['usedPercent']):g}% · 重置 {stamp(w.get('resetsAt'))}")
         detail.append(f"可用重置卡：{self.quota.get('credits', '未知')}（仅显示）")
         self.quota_detail.config(text='\n'.join(detail))
         latest = self.tibo.get('latest') or {}
         t = latest.get('announced_at')
-        date = stamp(dt.datetime.fromisoformat(t.replace('Z', '+00:00')).timestamp(), '%m-%d %H:%M') if t else '尚未获取'
-        watch = self.tibo.get('watch') or {}
-        deadline = iso_time(watch.get('expires_at'))
-        watch_active = bool(deadline and deadline > now)
+        date = stamp(iso_time(t), '%m-%d %H:%M') if t else '尚未获取'
+        notice = tibo_notice(self.tibo, now)
+        deadline = notice['deadline'] if notice and notice['active'] else None
         report = [f"最近已发布：{date} · {'普通重置' if latest.get('reset_type') == 'regular' else '重置卡/其他'}",
                   latest.get('display_text', latest.get('text', '尚无正文'))]
-        if watch:
-            report.extend(['', '预告观察 · ' + ('有迹象，尚未确认' if watch_active else '观察窗口已过期，等待新消息'),
-                           f"站点预测：{stamp(deadline)} 前可能重置",
-                           'Tibo 原文：'+watch.get('display_text', watch.get('text', '无原文'))])
-            report.append('预测来自第三方对推文的解读，不是确定的重置安排。')
+        if notice:
+            label = '已安排重置' if notice['kind'] == 'scheduled' else '预告观察'
+            report.extend(['', label + (' · 等待实际重置确认' if notice['active'] else ' · 预计时间已过，等待新消息'),
+                           f"站点解析上限：{stamp(notice['deadline'])} 前，可能更早",
+                           'Tibo 原文：'+notice.get('display_text', notice.get('text', '无原文')),
+                           '时间来自第三方站点解析；实际额度以账号读数为准。'])
         else:
             report.extend(['', '暂未获取到有效的预告观察。'])
         if self.errors.get('tibo'):
             report.append('公告检查失败，以上为上次缓存。')
         self.tibo_detail.config(text='\n'.join(report))
-        self.draw_forecast(forecast(windows, now, deadline if watch_active else None), now,
-                           deadline if watch_active else None, stale)
+        self.draw_forecast(forecast(windows, now, deadline), now, deadline, stale, notice)
         self.draw_stats(now)
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
@@ -644,66 +724,59 @@ class Widget:
             read_state += ' · 库内 Markdown 导出失败：'+self.markdown_error
         self.footer.config(text=f"额度更新 {stamp(self.quota.get('at'))} · 公告检查 {stamp(self.tibo.get('at'))}\n{read_state}\n剩余 20% / 10% / 0% 时提醒 · 声音{'关闭' if self.state.get('muted') else '开启'} · 登录自启{auto}\n拖动正文或顶部额度栏移动 · 点击分区标题收起详情")
 
-    def draw_forecast(self, f, now, deadline, stale):
+    def draw_forecast(self, f, now, deadline, stale, notice=None):
         c = self.timeline
         c.delete('all')
         if not f:
             self.forecast_detail.config(text='等待有效的 5 小时与周额度数据后计算。')
             return
-        messages = [f'绿虚线：{WEEKLY_PER_WINDOW:g}%/5h 推算；蓝线：实际读数。',
+        messages = ['绿虚线：按当前窗口剩余重算；蓝线：实际读数。',
                     '假设各窗口用满，末张卡片为最早可用完区间。',
                     '具体用完时间取决于使用速度。']
+        if f.get('idle'):
+            messages = ['5h 尚未开始使用；每 10 分钟检测一次，也可手动刷新。',
+                        '检测到消耗后，按接口时间显示倒计时和预测台阶。']
         if f['week_reset'] and f['earliest'] >= f['week_reset']:
             messages.append('注意：按此节奏，在系统周重置前无法用完当前周额度。')
         if stale:
             messages.append('额度数据已过时，以下仅为缓存推算。')
         self.forecast_detail.config(text='\n'.join(messages))
         width = max(600, c.winfo_width())
-        row_height = 104
         graph_left, graph_right, card_left = 95, 214, 246
-        height = len(f['slots'])*row_height+12
-        if deadline:
-            height += 78
-        plot_top, plot_bottom = 53, height-18
-        base = self.history_base
-        theory = forecast(base['windows'], base['at']) if base else None
-        theory = theory or f
+        layout=timeline_layout(f,now,deadline)
+        start,end=layout['start'],layout['end']
+        plot_top,plot_bottom=layout['top'],layout['bottom']
+        to_y=layout['y']
+        height=layout['height']
+        # Both the stairs and the cards start from the latest actual reading.
+        # A newly observed window therefore replaces the previous projection.
+        theory = f
         actual = [r for r in self.history_rows if r.get('week_remaining') is not None and
-                  r['at'] >= now-21600 and r.get('week_reset') and f.get('week_reset') and
+                  start <= r['at'] <= now and r.get('week_reset') and f.get('week_reset') and
                   abs(r['week_reset']-f['week_reset']) <= 90]
-        start = min([now]+[r['at'] for r in actual])
-        end = max(f['finish_by'], theory['finish_by'], deadline or 0, now+60)
-        to_y = lambda when: plot_top+(plot_bottom-plot_top)*(when-start)/(end-start)
         to_x = lambda remaining: graph_left+(graph_right-graph_left)*(100-max(0,min(100,remaining)))/100
         c.create_text(8, 12, text='时间 ↓  周剩 →', anchor='w', fill=MUTED, font=('Microsoft YaHei UI', 9))
         c.create_text(graph_left, 35, text='100%', anchor='w', fill=MUTED, font=('Microsoft YaHei UI', 8))
         c.create_text(graph_right, 35, text='0%', anchor='e', fill=MUTED, font=('Microsoft YaHei UI', 8))
         c.create_line(graph_right, plot_top, graph_right, plot_bottom, fill='#515a6e')
-        times = sorted(set([now]+[r['at'] for r in actual[::max(1,len(actual)//3)]]+[slot['end'] for slot in f['slots']]))
-        last_label_y = -100
-        for index, when in enumerate(times):
+        times=sorted(set([start,layout['current_start']]+[slot['end'] for slot in f['slots']]))
+        label_positions=[to_y(now)]
+        for when in times:
+            if when<start or when>end:
+                continue
             yy = to_y(when)
-            c.create_line(graph_left, yy, graph_right, yy, fill='#343b49', dash=(2, 4))
-            label = '现在' if when == now else stamp(when, '%m-%d\n%H:%M')
-            if yy-last_label_y >= 38:
+            c.create_line(graph_left, yy, width-6, yy, fill='#343b49', dash=(2,4),tags='time-boundary')
+            label=stamp(when,'%m-%d\n%H:%M')
+            if all(abs(yy-used_y)>=44 for used_y in label_positions):
                 c.create_text(graph_left-10, yy, text=label, anchor='e', fill=MUTED,
                               font=('Microsoft YaHei UI', 8))
-                last_label_y = yy
-        # Clip the fixed baseline to the visible range without rebasing it on each refresh.
-        previous = theory['remaining']
-        for when, remaining in theory['points']:
-            if when <= start:
-                previous = remaining
-        curve=[to_x(previous),to_y(start)]
-        for when, remaining in theory['points']:
-            if when < start:
-                continue
+                label_positions.append(yy)
+        # Historical actual samples stay visible; the projection begins now.
+        curve=[]
+        for when,remaining in visible_theory_points(theory,start,end):
             curve.extend([to_x(remaining),to_y(when)])
-        if len(curve)>=4:
+        if len(curve)>=4 and not f.get('idle'):
             c.create_line(*curve,fill=GREEN,width=2,dash=(5,3),tags='theory')
-        if end > theory['finish_by']:
-            c.create_line(graph_right,max(plot_top,to_y(theory['finish_by'])),graph_right,plot_bottom,
-                          fill=GREEN,width=2,dash=(5,3),tags='theory')
         for a,b in zip(actual,actual[1:]):
             if b['at']-a['at']<=900 and quota_delta(a,b,'week') is not None:
                 c.create_line(to_x(a['week_remaining']),to_y(a['at']),to_x(b['week_remaining']),to_y(b['at']),
@@ -711,18 +784,27 @@ class Widget:
         for row in actual:
             x,y=to_x(row['week_remaining']),to_y(row['at'])
             c.create_oval(x-3,y-3,x+3,y+3,fill='#80c6ed',outline='',tags='actual')
-        c.create_line(graph_left,to_y(now),graph_right,to_y(now),fill='#a4a9b8',dash=(2,2))
-        for index, slot in enumerate(f['slots']):
-            top = index*row_height+6
+        now_y=to_y(now)
+        c.create_line(graph_left,now_y,card_left-8,now_y,fill='#80c6ed',dash=(3,2),tags='now-line')
+        c.create_text(graph_left-10,now_y,text='现在\n'+stamp(now,'%H:%M'),anchor='e',fill='#80c6ed',font=('Microsoft YaHei UI',8,'bold'))
+        history_bottom=min(to_y(layout['current_start']),now_y)
+        if history_bottom-plot_top>=18:
+            c.create_rectangle(card_left,plot_top+3,width-6,history_bottom-3,fill='#1d2027',outline='#343b49',tags='history-card')
+            c.create_text(card_left+14,plot_top+19,text='历史 · 最近 5 小时内',anchor='w',fill=MUTED,font=('Microsoft YaHei UI',9,'bold'))
+            if history_bottom-plot_top>=74:
+                c.create_text(card_left+14,plot_top+53,text=f"{stamp(start,'%H:%M')} → {stamp(layout['current_start'],'%H:%M')}",
+                              anchor='w',fill=MUTED,font=('Microsoft YaHei UI',9))
+        for index, slot in enumerate(layout['slots']):
+            top,bottom=to_y(slot['start']),to_y(slot['end'])
             last = index == len(f['slots'])-1
             inside = deadline and slot['start'] <= deadline < slot['end']
             color = '#f5be6c' if inside else GREEN if last else '#80c6ed'
-            c.create_rectangle(card_left, top, width-6, top+92, fill=PANEL, outline=color if last or inside else '#343b49')
+            c.create_rectangle(card_left,top+3,width-6,bottom-3,fill=PANEL,outline=color if last or inside else '#343b49',tags=f'window-card-{index}')
             title = '当前窗口' if index == 0 else f'后续第 {index} 个窗口'
             if last:
                 title += ' · 可用完'
             c.create_text(card_left+14, top+19, text=title, anchor='w', fill=color, font=('Microsoft YaHei UI', 9, 'bold'))
-            begin = '现在' if index == 0 else stamp(slot['start'], '%H:%M')
+            begin = stamp(slot['start'], '%H:%M')
             cross_day = stamp(slot['start'], '%m-%d') != stamp(slot['end'], '%m-%d')
             end_label = ('次日 ' if cross_day else '')+stamp(slot['end'], '%H:%M')
             c.create_text(card_left+14, top+54, text=f"{begin} → {end_label}",
@@ -731,12 +813,14 @@ class Widget:
             c.create_text(width-20, top+54, text=f"{slot['after']:.1f}%", anchor='e', fill=color,
                           font=('Microsoft YaHei UI', 15, 'bold'))
         if deadline:
-            relation = '在以上窗口之后' if deadline >= f['finish_by'] else '落在上面橙色标记的窗口内'
             yy=to_y(deadline)
-            c.create_line(graph_left,yy,graph_right,yy,fill='#f5be6c',dash=(4,3),width=2)
+            c.create_line(graph_left,yy,width-6,yy,fill='#f5be6c',dash=(4,3),width=2,tags='reset-deadline')
             c.create_oval(graph_right-4,yy-4,graph_right+4,yy+4,fill='#f5be6c',outline='')
-            c.create_text(card_left, len(f['slots'])*row_height+20,
-                          text=f"预告 {stamp(deadline, '%m-%d %H:%M')} 前 · 未确认\n{relation}；可能更早重置。",
+            label = '公告上限' if notice and notice['kind'] == 'scheduled' else '预告上限'
+            capacity_text = '5h 尚未开始，暂不计算截止前的用量窗口。' if f.get('idle') else (
+                f"截止前可用当前窗口 + {max(0, math.ceil((deadline-f['next_reset'])/18000))} 个新窗口；理论最低周剩 {f['at_deadline']:.1f}%。")
+            c.create_text(card_left,plot_bottom+14,
+                          text=f"{label} {stamp(deadline, '%m-%d %H:%M')} · 可能更早\n{capacity_text}",
                           anchor='nw', width=width-card_left-12, fill='#f5be6c', font=('Microsoft YaHei UI', 9))
         c.configure(height=height)
 
