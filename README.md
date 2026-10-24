@@ -1,8 +1,8 @@
 # Codex Quota Widget
 
-Windows 桌面 Codex 额度悬浮窗：查看 5 小时和每周剩余额度、重置倒计时、Tibo 公告与本地使用统计。
+Windows 桌面用量悬浮窗：查看 Codex 5 小时/每周剩余额度、Tibo 公告，以及可选的 WorkBuddy 积分余额与到期批次。
 
-这是独立自用工具，不是 OpenAI 官方应用。界面为简体中文，使用 Windows 本机时区。此版本不包含 WorkBuddy 或机场流量模块，也不会读取这些软件的账户数据或配置。
+这是独立自用工具，不是 OpenAI 或腾讯的官方应用。界面为简体中文，使用 Windows 本机时区。不包含机场流量模块，不读取代理客户端配置。
 
 ## 功能
 
@@ -13,10 +13,12 @@ Windows 桌面 Codex 额度悬浮窗：查看 5 小时和每周剩余额度、�
 - 绿虚线与窗口卡片按最新剩余额度重算；蓝线表示真实采样。
 - 5h 剩余 100% 时显示“尚未开始使用”，隐藏倒计时并暂停未来窗口预测；检测到消耗后按接口时间恢复。
 - 自动识别 Tibo 已安排公告与观察预告的截止上限，绘制黄线并计算截止前的窗口容量；公告时间修订后自动更新。
+- 顶部“等待重置”开关：临时每 10 秒查询 Codex 额度，检测到剩余增加或重置时间明显变化后响铃一次并自动恢复普通频率。
 - 剩余额度达到 20%、10%、0% 时提醒；窗口到期提醒并重新读取；新公告提醒。
 - 固定播放系统自带 `Alarm02.wav` 一次，保留音量、试听与静音。
 - SQLite 本地采样，区间消耗柱状图与 24 小时已观测消耗汇总。
 - 可选 Obsidian Markdown 总览与按月明细导出。
+- 可折叠的 WorkBuddy 分区：个人账号登录、总余额、积分分类、批次到期倒计时、提醒与历史记录；每 10 分钟更新，也可手动查询。
 
 ## 运行要求
 
@@ -24,7 +26,7 @@ Windows 桌面 Codex 额度悬浮窗：查看 5 小时和每周剩余额度、�
 - 已安装并登录 Codex CLI，或者可发现本机 Codex 应用自带的 CLI。
 - 能连接 Codex 服务和公告站点。
 
-仅使用 Python 标准库，没有第三方 Python 依赖。不需要提供 API Key，也不会发起模型推理请求。
+仅使用 Python 标准库，没有第三方 Python 依赖。不需要提供模型 API Key，也不会发起模型推理请求。WorkBuddy 功能需要单独登录自己的账号。
 
 ## 启动
 
@@ -48,6 +50,11 @@ python usage_widget.py
 | `widget-status.json` | 最近成功读取、脱敏错误、采样/导出状态 |
 | `data/usage-history.sqlite3` | 成功采样及脱敏错误类别 |
 | `history-export.local.json` | 可选的本机 Markdown 导出配置 |
+| `data/workbuddy-client.dpapi` | WorkBuddy 客户端登录态，绑定当前 Windows 用户加密保存 |
+| `data/workbuddy-client-pending.dpapi` | 临时客户端登录会话，加密保存 |
+| `data/workbuddy-credit-history.json` | WorkBuddy 线上余额、批次与读取历史 |
+| `data/workbuddy-history.json` | 可选的手动快照导入历史 |
+| `workbuddy.local.json` | 可选快照来源与 Markdown 输出路径 |
 
 可在启动前设置 `CODEX_QUOTA_DATA_DIR` 更改数据目录。不要提交自己的数据或本机配置。
 
@@ -94,6 +101,32 @@ Tibo 优先读取 `scheduled.scheduled_for`，无有效安排时回退到 `watch
 3. 刷新后生成总览及按月全部采样表；以后成功写入读数后自动更新。
 
 只覆盖含本工具生成标记的文件，目标必须位于配置的 Vault 内。Markdown 为只读派生查看稿，SQLite 是原始数据。同一目标只指定一个设备生成，避免同步冲突。关闭导出可移走本机导出配置；历史 Markdown 不会被删除。
+
+## WorkBuddy 积分
+
+该分区默认折叠，未登录时不查询账户。首次使用：
+
+1. 展开“WorkBuddy 积分”，点击“登录 / 重新登录”。
+2. 在腾讯登录页登录需要查询的个人账号，10 分钟内完成。
+3. 工具取得独立的客户端登录态，加密保存在运行数据目录；之后每 10 分钟查询一次，顶部刷新或“查询线上余额”可立即查询。
+
+这条客户端登录流程不依赖开放平台应用审核，不需要 Client ID / Client Secret，不解密或修改 WorkBuddy 客户端的账户文件。令牌过期时尝试刷新，刷新失败则提示重新登录，不把余额当作零。DPAPI 文件仅适用于原 Windows 用户，不应作为可迁移的登录备份。
+
+显示总剩余、积分分类、各批剩余与到期时间，按批次提供 7 天、3 天、24 小时、1 小时及到期提醒；提醒复用静音和音量设置，可单独关闭。旧手动快照保留作参考，不与线上读数混算。
+
+客户端计费接口固定向 `https://www.workbuddy.cn` 发送登录与积分查询请求，只允许总额、套餐明细和必要的登录/刷新端点；不调用签到、领奖、对话、任务或账号切换接口。它们是客户端内部接口，可能随版本变化。协议参考：[buddyToken](https://github.com/CaoDonald/buddyToken/blob/main/workbuddy-api.js)、[stravia WorkBuddy adapter](https://github.com/Chikage0o0/stravia-vendor-workbuddy/blob/master/src/auth.rs)。本工具没有安装或运行这些项目。
+
+读取时校验金额、分页总数、批次身份与明细合计。总额成功而批次失败时保留上次成功批次及其采集时间。余额变化可能来自消费、失效或赠送，不全部记为消费；逐批统计依据明确的已用字段变化，不假设先到期先扣。
+
+### WorkBuddy Markdown 与离线快照
+
+默认不导出，也不扫描知识库。需要时，将 `workbuddy.local.example.json` 复制到运行数据目录并命名为 `workbuddy.local.json`，手动填写：
+
+- `live_markdown_path`：线上余额、最新批次及逐批变化的 Markdown 完整输出路径。
+- `markdown_path`：可选离线快照历史的 Markdown 完整输出路径。
+- `snapshot_path`：可选快照 JSON 来源路径；也可在分区中点击“导入积分快照 JSON”。
+
+空路径表示不启用。只覆盖本工具生成标记的 Markdown；旧数据与凭据不随源码上传。WorkBuddy 导出及源批次时间标明 UTC+8，界面到期时间转换为本机时区。只指定一台设备生成同一批笔记。
 
 ## 公告来源
 

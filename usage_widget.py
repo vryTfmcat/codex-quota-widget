@@ -11,6 +11,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import filedialog, ttk
+from tkinter import font as tkfont
 import urllib.request
 import webbrowser
 import winsound
@@ -20,6 +22,9 @@ import io
 import wave
 from array import array
 from usage_history import UsageHistory, intervals, quota_delta
+from workbuddy_usage import SnapshotStore, balance_view, expiry_alerts, timestamp as wb_timestamp
+from workbuddy_api import CreditHistory, ApiError
+from workbuddy_client import ClientBilling
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('CODEX_QUOTA_DATA_DIR', str(Path(os.environ['LOCALAPPDATA']) / 'CodexQuotaWidgetPortable'))).expanduser().resolve()
@@ -275,6 +280,8 @@ def read_tibo():
             'watch': data.get('watch'), 'at': time.time()}
 
 
+
+
 def window_key(w):
     # Backend timestamps sometimes vary by a second; group the same reset minute.
     return f"{w['windowDurationMins']}:{int(w.get('resetsAt') or 0)//60}"
@@ -319,6 +326,28 @@ def due_alerts(now, state):
     return alerts
 
 
+def reset_changes(before, after):
+    """Ignore consumption, missing fields and small timestamp corrections."""
+    previous = {w.get('windowDurationMins'): w for w in before.get('windows', [])}
+    messages = []
+    for current in after.get('windows', []):
+        duration = current.get('windowDurationMins')
+        old = previous.get(duration)
+        if duration not in (300, 10080) or not old:
+            continue
+        a, b = old.get('usedPercent'), current.get('usedPercent')
+        if a is None or b is None:
+            continue
+        label = '5h' if duration == 300 else '每周'
+        if b < a-0.001:
+            messages.append(f'{label}剩余额度：{max(0,100-a):g}% → {max(0,100-b):g}%')
+        # An idle 5h window receiving its first task is not a reset event.
+        old_time, new_time = old.get('resetsAt'), current.get('resetsAt')
+        if old_time and new_time and abs(new_time-old_time)>90 and not five_idle(old):
+            messages.append(f'{label}重置时间：{stamp(old_time)} → {stamp(new_time)}')
+    return messages
+
+
 class Widget:
     def __init__(self, smoke=False):
         self.root = tk.Tk()
@@ -330,6 +359,24 @@ class Widget:
         self.state = load(STATE)
         self.quota = self.state.get('quota') or {}
         self.tibo = self.state.get('tibo') or {}
+        self.wb_store = None
+        self.wb_error = None
+        self.wb_export_error = None
+        self.wb_checked = 0
+        self.wb_config = load(ROOT / 'workbuddy.local.json')
+        self.wb_api = ClientBilling(ROOT / 'data/workbuddy-client.dpapi')
+        self.wb_live = None
+        self.wb_live_history = None
+        self.wb_live_export_error = None
+        try:
+            self.wb_live_history = CreditHistory(ROOT / 'data/workbuddy-credit-history.json')
+            self.wb_live = self.wb_live_history.samples[-1] if self.wb_live_history.samples else None
+        except Exception:
+            self.wb_live_export_error = '线上读数历史读取失败；原文件未覆盖。'
+        try:
+            self.wb_store = SnapshotStore(ROOT / 'data/workbuddy-history.json')
+        except Exception as error:
+            self.wb_error = '本地历史读取失败：' + type(error).__name__
         self.errors = {}
         self.history_error = None
         self.markdown_error = None
@@ -349,7 +396,9 @@ class Widget:
         self.busy = set()
         self.expanded = False
         self.closed = threading.Event()
-        self.last_start = {'quota': 0, 'tibo': 0}
+        self.last_start = {'quota': 0, 'tibo': 0, 'workbuddy-live': 0}
+        self.reset_watch = False
+        self.reset_watch_baseline = None
         self.sound_stop = threading.Event()
         self.root.geometry(self.state.get('position', '+80+65'))
         self.build()
@@ -425,6 +474,8 @@ class Widget:
         self.main.pack(side='left')
         self.refresh_button = self.button(bar, '刷新', self.refresh)
         self.refresh_button.pack(side='left', padx=(12, 0))
+        self.reset_watch_button = self.button(bar, '等待重置', self.toggle_reset_watch)
+        self.reset_watch_button.pack(side='left', padx=(6, 0))
         self.chevron = self.label(bar, '▾', 11, MUTED)
         self.chevron.pack(side='left', padx=(10, 0))
         for element in (bar, drag, self.main, self.chevron):
@@ -471,6 +522,44 @@ class Widget:
         self.tibo_detail = self.label(tibo_card, anchor='w', justify='left', wraplength=700)
         self.tibo_detail.pack(fill='x')
         self.button(tibo_card, '打开预告原帖', self.open_tibo).pack(anchor='w', pady=(6, 0))
+        self.state.setdefault('sections', {}).setdefault('WorkBuddy 积分', False)
+        wb_card = self.section('WorkBuddy 积分')
+        self.wb_live_detail = self.label(wb_card, anchor='w', justify='left', wraplength=700)
+        self.wb_live_detail.pack(fill='x', pady=(0, 7))
+        live_actions = tk.Frame(wb_card, bg=BG)
+        live_actions.pack(fill='x', pady=(0, 8))
+        self.button(live_actions, '登录 / 重新登录', self.wb_authorize_api).pack(side='left', padx=(0, 6))
+        self.button(live_actions, '查询线上余额', self.wb_fetch_api).pack(side='left')
+        self.wb_summary = self.label(wb_card, anchor='w', justify='left', wraplength=700)
+        self.wb_summary.pack(fill='x')
+        actions = tk.Frame(wb_card, bg=BG)
+        actions.pack(fill='x', pady=6)
+        self.button(actions, '导入积分快照 JSON', self.wb_import).pack(side='left', padx=(0, 6))
+        self.button(actions, '重新读取快照', self.wb_reload).pack(side='left', padx=(0, 6))
+        self.wb_reminder_button = self.button(actions, '到期提醒：开', self.wb_toggle_reminders)
+        self.wb_reminder_button.pack(side='left')
+        self.button(wb_card, '打开库内积分记录', self.wb_open_record).pack(anchor='w', pady=(0, 6))
+        style = ttk.Style(self.root)
+        style.theme_use('clam')
+        table_font = tkfont.Font(root=self.root, family='Microsoft YaHei UI', size=9)
+        style.configure('WorkBuddy.Treeview', background=PANEL, fieldbackground=PANEL, foreground=FG,
+                        font=table_font, rowheight=table_font.metrics('linespace')+14,
+                        borderwidth=0, lightcolor=PANEL, darkcolor=PANEL)
+        style.map('WorkBuddy.Treeview', background=[('selected', '#375368')], foreground=[('selected', FG)])
+        style.configure('WorkBuddy.Treeview.Heading', background='#303641', foreground=GREEN,
+                        font=('Microsoft YaHei UI', 9, 'bold'), padding=(10, 9), relief='flat')
+        style.map('WorkBuddy.Treeview.Heading', background=[('active', '#3a4350')])
+        self.wb_table_font = table_font
+        self.wb_table = ttk.Treeview(wb_card, style='WorkBuddy.Treeview', columns=('expiry', 'remaining', 'state'), show='headings', height=7)
+        for column, label, width in [('expiry', '到期时间（本机时区）', table_font.measure('2026-11-18 00:27:58')+32), ('remaining', '快照剩余积分', table_font.measure('快照剩余积分')+36), ('state', '状态', table_font.measure('到期待核对')+42)]:
+            self.wb_table.heading(column, text=label)
+            self.wb_table.column(column, width=width, minwidth=width, anchor='w')
+        self.wb_table.pack(fill='x')
+        self.wb_table.bind('<MouseWheel>', self.wb_scroll)
+        self.wb_history_detail = self.label(wb_card, size=9, fg=MUTED, anchor='w', justify='left', wraplength=700)
+        self.wb_history_detail.pack(fill='x', pady=6)
+        self.button(wb_card, '展开 / 收起模型倍率参考', self.wb_models_toggle).pack(anchor='w')
+        self.wb_models_detail = self.label(wb_card, size=9, fg=MUTED, anchor='w', justify='left', wraplength=700)
         sound_card = self.section('提醒与声音')
         self.label(sound_card, '固定提示音：Windows Alarm02 · 每次只播放一次。', 9, MUTED,
                    anchor='w').pack(fill='x', pady=(0, 6))
@@ -608,13 +697,203 @@ class Widget:
                 self.q.put((name, fn(), None))
             except Exception as e:
                 # Never write exception text: HTTP exceptions can contain secret URLs.
-                reason = str(e) if isinstance(e, QuotaReadError) else type(e).__name__
+                reason = str(e) if isinstance(e, (QuotaReadError, ApiError)) else type(e).__name__
                 self.q.put((name, None, reason))
         threading.Thread(target=work, daemon=True).start()
 
     def refresh(self):
         self.start('quota', read_quota, reason='manual')
         self.start('tibo', read_tibo)
+        self.wb_reload()
+        self.wb_fetch_api()
+
+    def wb_fetch_api(self):
+        if self.wb_api.configured and 'workbuddy-auth' not in self.busy:
+            self.start('workbuddy-live', self.wb_api.fetch)
+
+    def wb_authorize_api(self):
+        if not {'workbuddy-auth', 'workbuddy-live'} & self.busy:
+            self.start('workbuddy-auth', lambda: self.wb_api.authorize(webbrowser.open, self.closed))
+
+
+    def wb_show_live(self, now):
+        messages = []
+        if self.wb_live:
+            row = self.wb_live
+            old = now-row['at']>1200
+            messages.extend([f'线上总剩余 {row["remaining"]:,.2f} 积分' + (' · 旧读数' if old else ''),
+                             f'腾讯客户端接口 · 更新 {stamp(row["at"])}',
+                             ' · '.join(f'{r["name"]} {r["remaining"]:,.2f}' for r in row.get('categories',[]))])
+            if row.get('detail_error'):
+                messages.append('总余额已更新，批次读取未完成；下方保留旧批次并注明采集时间。')
+        else:
+            messages.append('线上余额尚未读取；下方为手动快照。')
+        if 'workbuddy-auth' in self.busy:
+            messages.append('等待腾讯客户端登录，10 分钟内完成；不依赖应用审核。')
+        elif 'workbuddy-live' in self.busy:
+            messages.append('正在查询腾讯余额与批次…')
+        elif not self.wb_api.configured:
+            messages.append('点击“登录 / 重新登录”，不需要开放平台应用审核。')
+        else:
+            messages.append('线上余额每 10 分钟读取；顶部刷新也会查询。')
+        error = self.errors.get('workbuddy-auth') or self.errors.get('workbuddy-live')
+        if error:
+            labels = {'login':'登录态失效，请重新登录', 'permission':'服务端拒绝读取，请重新登录后重试',
+                      'client-login-expired':'登录等待已过期，请重新登录',
+                      'permission-not-confirmed':'授权响应未确认积分读取权限',
+                      'endpoint-unavailable':'官方余额端点不可用，需核对当前接口',
+                      'callback-port-in-use':'本机 8766 端口被占用', 'rate-limit':'服务端限频，稍后重试'}
+            messages.append('线上查询/授权未完成：' + labels.get(error, error) + '。旧读数与快照保留。')
+        if self.wb_live_export_error:
+            messages.append(self.wb_live_export_error)
+        self.wb_live_detail.config(text='\n'.join(messages))
+
+    def toggle_reset_watch(self):
+        self.reset_watch = not self.reset_watch
+        # Old cached data must not be mistaken for a newly detected reset.
+        self.reset_watch_baseline = self.quota if self.reset_watch and time.time()-self.quota.get('at',0)<=1200 else None
+        if self.reset_watch:
+            self.start('quota', read_quota, reason='reset-watch')
+        self.display()
+
+    def check_reset_watch(self, data):
+        if not self.reset_watch:
+            return
+        changes = reset_changes(self.reset_watch_baseline, data) if self.reset_watch_baseline else []
+        # Only successful, comparable observations form the next baseline.
+        if any(w.get('windowDurationMins') in (300,10080) and w.get('usedPercent') is not None
+               for w in data.get('windows', [])):
+            merged = {w.get('windowDurationMins'): w for w in (self.reset_watch_baseline or {}).get('windows', [])}
+            merged.update({w.get('windowDurationMins'): w for w in data.get('windows', []) if w.get('usedPercent') is not None})
+            self.reset_watch_baseline = dict(data, windows=list(merged.values()))
+        if changes:
+            self.reset_watch = False
+            self.reset_watch_baseline = None
+            self.alert('检测到额度/重置时间变化：\n'+'\n'.join(changes)+'\n已结束 10 秒检测，恢复每 10 分钟更新。')
+
+    def wb_scroll(self, event):
+        self.wb_table.yview_scroll(-int(event.delta/120), 'units')
+        return 'break'
+
+    def wb_toggle_reminders(self):
+        self.state['workbuddy_reminders'] = not self.state.get('workbuddy_reminders', True)
+        self.persist()
+
+    def wb_import(self):
+        path = filedialog.askopenfilename(parent=self.root, title='导入 WorkBuddy 本地积分快照',
+                                          filetypes=[('JSON 快照', '*.json')])
+        if path:
+            self.wb_reload(path)
+
+    def wb_models_toggle(self):
+        if self.wb_models_detail.winfo_manager():
+            self.wb_models_detail.pack_forget()
+        else:
+            self.wb_models_detail.pack(fill='x', pady=5)
+
+    def wb_open_record(self):
+        for path in (self.wb_config.get('live_markdown_path'), self.wb_config.get('markdown_path')):
+            if path and Path(path).is_file():
+                os.startfile(path)
+                break
+
+    def wb_reload(self, path=None):
+        self.wb_checked = time.monotonic()
+        if not self.wb_store:
+            return
+        source = path or self.wb_config.get('snapshot_path')
+        if not source:
+            self.wb_error = '尚未选择快照文件；点击导入。'
+            return
+        try:
+            self.wb_store.import_file(source, time.time())
+            if path:
+                self.wb_config['snapshot_path'] = str(Path(path).resolve())
+                save(ROOT / 'workbuddy.local.json', self.wb_config)
+            self.wb_error = None
+        except Exception as error:
+            # Preserve the previous snapshot; never turn a read failure into zero.
+            self.wb_error = '快照读取失败：' + type(error).__name__ + '；保留上次快照。'
+        target = self.wb_config.get('markdown_path')
+        if target:
+            try:
+                self.wb_store.export_markdown(target)
+                self.wb_export_error = None
+            except Exception as error:
+                self.wb_export_error = 'Markdown 导出失败：' + type(error).__name__
+
+    def wb_display(self, now):
+        self.wb_show_live(now)
+        live_snapshot = (self.wb_live or {}).get('snapshot')
+        data = live_snapshot or (self.wb_store.latest if self.wb_store else None)
+        self.wb_reminder_button.config(text='到期提醒：' + ('开' if self.state.get('workbuddy_reminders', True) else '关'))
+        if not data:
+            self.wb_summary.config(text=self.wb_error or '尚无快照；余额未知。')
+            return
+        view = balance_view(data, now)
+        captured = data.get('captured_at') or (data['captured_date'] + '（准确时刻未知）')
+        balance = data.get('account_balance')
+        text = ([f'总剩余 {balance["remaining"]:,.2f} 积分 · 手动更新，非实时',
+                 ' · '.join(f'{r["name"]} {r["remaining"]:,.2f}' for r in balance['categories']),
+                 '套餐基础积分到期时间未知；以下仅显示奖励批次。'] if balance else [])
+        text.extend([f'奖励批次快照 · 非实时 · 采集 {captured}',
+                     f'奖励快照剩余 {data["total_remaining"]:,.2f} · 尚未到期部分 {view["unexpired_snapshot"]:,.2f}'])
+        if live_snapshot:
+            text = [f'线上批次明细 · 读取 {stamp(self.wb_live.get("batches_at",self.wb_live["at"]))}' +
+                    (' · 上次成功批次' if self.wb_live.get('detail_error') else '')]
+        row = view['next']
+        if row:
+            seconds = max(0, int(wb_timestamp(row['expires_at'])-now))
+            text.extend([f'最近到期：{stamp(wb_timestamp(row["expires_at"]))} · 当时剩 {row["remaining"]:g}',
+                         f'距到期 {seconds//86400} 天 {seconds%86400//3600:02}:{seconds%3600//60:02}:{seconds%60:02}'])
+        else:
+            text.append('所列正余额批次均已过预计到期时间；当前余额未知。')
+        if view['past_due_snapshot']:
+            text.append(f'已过期时刻的快照余额 {view["past_due_snapshot"]:g}；不记为已核实消费或失效。')
+        text.append('每 10 分钟更新；顶部刷新或“查询线上余额”可立即查询。' if live_snapshot else
+                    '此处为旧快照；余额与批次未扣后续消费。')
+        text.append(f'逐批明细共 {len(data["batches"])} 笔，可在下表内滚轮查看。')
+        if self.wb_error:
+            text.append(self.wb_error)
+        if self.wb_export_error:
+            text.append(self.wb_export_error)
+        self.wb_summary.config(text='\n'.join(text))
+        # Rebuild only on an import or expiration-state transition, preserving scroll.
+        signature = (str(self.wb_live['at']) if live_snapshot else self.wb_store.entries[-1]['hash'], tuple(wb_timestamp(r['expires_at']) <= now for r in data['batches']))
+        if signature != getattr(self, 'wb_table_signature', None):
+            self.wb_table_signature = signature
+            self.wb_table.delete(*self.wb_table.get_children())
+            for r in sorted(data['batches'], key=lambda r: wb_timestamp(r['expires_at'])):
+                status = '已用完' if not r['remaining'] else '到期待核对' if wb_timestamp(r['expires_at']) <= now else '待核对'
+                if live_snapshot and r['remaining'] and wb_timestamp(r['expires_at'])>now:
+                    status = '有效'
+                self.wb_table.insert('', 'end', values=(stamp(wb_timestamp(r['expires_at']), '%Y-%m-%d %H:%M:%S'), f'{r["remaining"]:g}', status))
+            lines = ['导入与变化记录（导入顺序；无精确采集时刻时不推算时段用量）：']
+            for entry in (self.wb_store.entries[-4:] if self.wb_store else []):
+                lines.append(stamp(entry['imported_at']) + ' 导入 · 采集 ' + entry['snapshot']['captured_date'])
+                lines.extend(entry['changes'][:6])
+                if len(entry['changes']) > 6:
+                    lines.append('更多逐批变化保留在本地历史文件。')
+            lines.append('倍率截图仅供参考，不用于推算费用；未假设先到期先扣。')
+            if live_snapshot:
+                lines = ['最近线上读数（余额变化不统一视为消费）：']
+                samples = self.wb_live_history.samples if self.wb_live_history else []
+                for sample in samples[-4:]:
+                    lines.append(f'{stamp(sample["at"])} · 剩余 {sample["remaining"]:,.2f}')
+                lines.append('完整批次与变化记录已写入库内实时积分记录；原手动快照保留。')
+            self.wb_history_detail.config(text='\n'.join(lines))
+            reference = (self.wb_store.latest if self.wb_store else None) or data
+            rates = reference.get('model_display_rates', [])
+            self.wb_models_detail.config(text='采集 ' + reference['captured_date'] + ' 的菜单截图，非当前计费公式。\n' +
+                '\n'.join(f'{r["name"]}：{r["display_multiplier"]:g}×  {r.get("label", "")}' for r in rates))
+        if self.state.get('workbuddy_reminders', True):
+            seen = self.state.setdefault('workbuddy_expiry_seen', {})
+            before = json.dumps(seen, sort_keys=True)
+            messages = expiry_alerts(data, now, seen)
+            if messages:
+                self.alert('\n\n'.join(messages[:4]) + (f'\n另有 {len(messages)-4} 笔，请展开 WorkBuddy 查看。' if len(messages)>4 else ''))
+            if before != json.dumps(seen, sort_keys=True):
+                self.persist()
 
     def apply(self, name, data, error):
         self.busy.discard(name)
@@ -627,7 +906,26 @@ class Widget:
                     self.history_error = type(failure).__name__
         else:
             self.errors.pop(name, None)
+            if name in ('workbuddy-live', 'workbuddy-auth'):
+                if not data.get('snapshot') and self.wb_live and self.wb_live.get('snapshot') and data.get('account_id') == self.wb_live.get('account_id'):
+                    data = dict(data, snapshot=self.wb_live['snapshot'],
+                                batches_at=self.wb_live.get('batches_at',self.wb_live['at']))
+                self.wb_live = data
+                self.errors.pop('workbuddy-auth', None)
+                self.errors.pop('workbuddy-live', None)
+                self.last_start['workbuddy-live'] = time.monotonic()
+                try:
+                    if self.wb_live_history is None:
+                        raise ApiError('history-unavailable')
+                    self.wb_live_history.record(data)
+                    target = self.wb_config.get('live_markdown_path')
+                    if target:
+                        self.wb_live_history.export_markdown(target)
+                    self.wb_live_export_error = None
+                except Exception:
+                    self.wb_live_export_error = '线上余额已读取，但本地历史/Markdown 写入失败。'
             if name == 'quota':
+                self.check_reset_watch(data)
                 self.quota = data
                 self.state['quota'] = data
                 if self.history:
@@ -663,6 +961,7 @@ class Widget:
                 self.state['tibo'] = self.tibo
         self.persist()
         save(STATUS, {'checked_at': time.time(), 'quota_at': self.quota.get('at'),
+                      'reset_watch_active': self.reset_watch,
                       'tibo_at': self.tibo.get('at'), 'errors': self.errors,
                       'markdown_error': self.markdown_error, 'markdown_at': self.markdown_at,
                       'history_error': self.history_error,
@@ -677,6 +976,8 @@ class Widget:
         failed = 'quota' in self.errors
         self.refresh_button.config(text='刷新中…' if 'quota' in self.busy else '刷新',
                                    state='disabled' if 'quota' in self.busy else 'normal')
+        self.reset_watch_button.config(text='10s检测中 · 停止' if self.reset_watch else '等待重置',
+                                       fg=GREEN if self.reset_watch else FG)
         if five:
             short = five_summary(five, now)
             if week:
@@ -711,6 +1012,7 @@ class Widget:
         self.tibo_detail.config(text='\n'.join(report))
         self.draw_forecast(forecast(windows, now, deadline), now, deadline, stale, notice)
         self.draw_stats(now)
+        self.wb_display(now)
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
                 winreg.QueryValueEx(key, 'CodexQuotaWidgetPortable')
@@ -718,6 +1020,8 @@ class Widget:
         except FileNotFoundError:
             auto = '关'
         read_state = '正在刷新额度…' if 'quota' in self.busy else ('额度读取失败；可点击顶部刷新，或等下次自动更新。' if failed else '额度与公告每 10 分钟自动更新；顶部可手动刷新。')
+        if self.reset_watch:
+            read_state += ' · 等待重置：额度每 10 秒检测，变化后响铃并自动停止；公告仍每 10 分钟。'
         if self.errors.get('quota') == 'login':
             read_state = '登录状态失效，请检查 Codex 当前账号登录后再刷新。'
         if self.markdown_error:
@@ -878,9 +1182,13 @@ class Widget:
             self.last_start['quota'] = 0
         while not self.q.empty():
             self.apply(*self.q.get())
-        for name, interval, fn in [('quota', 600, read_quota), ('tibo', 600, read_tibo)]:
+        for name, interval, fn in [('quota', 10 if self.reset_watch else 600, read_quota), ('tibo', 600, read_tibo)]:
             if time.monotonic()-self.last_start[name] >= interval:
-                self.start(name, fn)
+                self.start(name, fn, reason='reset-watch' if name=='quota' and self.reset_watch else 'auto')
+        if time.monotonic()-self.wb_checked >= 600:
+            self.wb_reload()
+        if self.wb_api.configured and time.monotonic()-self.last_start.get('workbuddy-live',0) >= 600:
+            self.wb_fetch_api()
         self.display()
         self.root.after(1000, self.tick)
 

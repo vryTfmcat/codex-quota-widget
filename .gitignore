@@ -15,6 +15,10 @@ data/
 widget-state.json
 widget-status.json
 history-export.local.json
+workbuddy.local.json
+*.dpapi
+assets/
+workbuddy-client-pending*
 settings.json
 .env
 .env.*

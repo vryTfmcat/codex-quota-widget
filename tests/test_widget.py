@@ -1,3 +1,4 @@
+import _test_environment
 import os
 from pathlib import Path
 import tempfile
@@ -100,7 +101,8 @@ class WidgetTests(unittest.TestCase):
             curve = app.timeline.coords(app.timeline.find_withtag('theory')[0])
             self.assertAlmostEqual(curve[0], 95+(214-95)*.4)
             self.assertTrue(app.timeline.find_withtag('window-card-0'))
-            self.assertFalse(any('WorkBuddy' in name or 'Flower' in name for name in app.section_controls))
+            self.assertIn('WorkBuddy 积分', app.section_controls)
+            self.assertFalse(any('Flower' in name for name in app.section_controls))
         finally:
             app.close()
 
