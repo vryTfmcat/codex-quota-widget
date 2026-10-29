@@ -39,6 +39,8 @@ BG, PANEL, FG, MUTED, GREEN = '#17191e', '#23262e', '#f1f2f6', '#a4a9b8', '#9cdd
 ACTIVE = set()
 ACTIVE_LOCK = threading.Lock()
 ALARM_PATH = Path(os.environ['WINDIR']) / 'Media/Alarm02.wav'
+QUOTA_REFRESH_INTERVALS = {'等待重置10s': 10, '每30秒': 30, '每1分钟': 60, '每2分钟': 120,
+                           '每5分钟': 300, '每10分钟': 600, '每30分钟': 1800}
 
 
 def alarm_wave(volume):
@@ -397,7 +399,10 @@ class Widget:
         self.expanded = False
         self.closed = threading.Event()
         self.last_start = {'quota': 0, 'tibo': 0, 'workbuddy-live': 0}
-        self.reset_watch = False
+        saved_interval = self.state.get('quota_refresh_seconds', 600)
+        self.normal_refresh_seconds = saved_interval if type(saved_interval) is int and saved_interval in QUOTA_REFRESH_INTERVALS.values() and saved_interval != 10 else 600
+        self.quota_refresh_seconds = self.normal_refresh_seconds
+        self.reset_watch = self.quota_refresh_seconds < 600
         self.reset_watch_baseline = None
         self.sound_stop = threading.Event()
         self.root.geometry(self.state.get('position', '+80+65'))
@@ -474,8 +479,15 @@ class Widget:
         self.main.pack(side='left')
         self.refresh_button = self.button(bar, '刷新', self.refresh)
         self.refresh_button.pack(side='left', padx=(12, 0))
-        self.reset_watch_button = self.button(bar, '等待重置', self.toggle_reset_watch)
-        self.reset_watch_button.pack(side='left', padx=(6, 0))
+        self.refresh_interval_var = tk.StringVar(value=self.refresh_interval_label())
+        self.refresh_interval_menu = tk.OptionMenu(bar, self.refresh_interval_var,
+                                                 *QUOTA_REFRESH_INTERVALS, command=self.set_refresh_interval)
+        self.refresh_interval_menu.config(bg=PANEL, fg=FG, activebackground='#375368', activeforeground=FG,
+                                          highlightthickness=0, bd=0, font=('Microsoft YaHei UI', 10),
+                                          cursor='hand2', padx=9, pady=6)
+        self.refresh_interval_menu['menu'].config(bg=PANEL, fg=FG, activebackground='#375368',
+                                                 activeforeground=FG, font=('Microsoft YaHei UI', 10))
+        self.refresh_interval_menu.pack(side='left', padx=(6, 0))
         self.chevron = self.label(bar, '▾', 11, MUTED)
         self.chevron.pack(side='left', padx=(10, 0))
         for element in (bar, drag, self.main, self.chevron):
@@ -748,12 +760,24 @@ class Widget:
             messages.append(self.wb_live_export_error)
         self.wb_live_detail.config(text='\n'.join(messages))
 
-    def toggle_reset_watch(self):
-        self.reset_watch = not self.reset_watch
+    def refresh_interval_label(self):
+        return next(label for label, seconds in QUOTA_REFRESH_INTERVALS.items() if seconds == self.quota_refresh_seconds)
+
+
+    def set_refresh_interval(self, label):
+        if label not in QUOTA_REFRESH_INTERVALS:
+            return
+        self.quota_refresh_seconds = QUOTA_REFRESH_INTERVALS[label]
+        self.refresh_interval_var.set(label)
+        if self.quota_refresh_seconds != 10:
+            self.normal_refresh_seconds = self.quota_refresh_seconds
+        # The 10-second watch is temporary; restart with the last normal interval.
+        self.state['quota_refresh_seconds'] = self.normal_refresh_seconds
+        self.reset_watch = self.quota_refresh_seconds < 600
         # Old cached data must not be mistaken for a newly detected reset.
         self.reset_watch_baseline = self.quota if self.reset_watch and time.time()-self.quota.get('at',0)<=1200 else None
-        if self.reset_watch:
-            self.start('quota', read_quota, reason='reset-watch')
+        self.persist()
+        self.start('quota', read_quota, reason='reset-watch' if self.reset_watch else 'manual')
         self.display()
 
     def check_reset_watch(self, data):
@@ -767,9 +791,16 @@ class Widget:
             merged.update({w.get('windowDurationMins'): w for w in data.get('windows', []) if w.get('usedPercent') is not None})
             self.reset_watch_baseline = dict(data, windows=list(merged.values()))
         if changes:
-            self.reset_watch = False
-            self.reset_watch_baseline = None
-            self.alert('检测到额度/重置时间变化：\n'+'\n'.join(changes)+'\n已结束 10 秒检测，恢复每 10 分钟更新。')
+            if self.quota_refresh_seconds == 10:
+                self.quota_refresh_seconds = self.normal_refresh_seconds
+                self.refresh_interval_var.set(self.refresh_interval_label())
+                self.reset_watch = self.quota_refresh_seconds < 600
+                self.reset_watch_baseline = dict(data, windows=list(merged.values())) if self.reset_watch else None
+                self.persist()
+                message = f'\n已关闭等待重置，恢复{self.refresh_interval_label()}更新。'
+            else:
+                message = f'\n继续按{self.refresh_interval_label()}更新。'
+            self.alert('检测到额度/重置时间变化：\n'+'\n'.join(changes)+message)
 
     def wb_scroll(self, event):
         self.wb_table.yview_scroll(-int(event.delta/120), 'units')
@@ -972,12 +1003,11 @@ class Widget:
         five = next((w for w in windows if w.get('windowDurationMins') == 300), None)
         week = next((w for w in windows if w.get('windowDurationMins') == 10080), None)
         now = time.time()
-        stale = now-self.quota.get('at', 0) > 1200
+        stale = now-self.quota.get('at', 0) > max(1200, self.quota_refresh_seconds*2)
         failed = 'quota' in self.errors
         self.refresh_button.config(text='刷新中…' if 'quota' in self.busy else '刷新',
                                    state='disabled' if 'quota' in self.busy else 'normal')
-        self.reset_watch_button.config(text='10s检测中 · 停止' if self.reset_watch else '等待重置',
-                                       fg=GREEN if self.reset_watch else FG)
+        self.refresh_interval_menu.config(fg=GREEN if self.reset_watch else FG)
         if five:
             short = five_summary(five, now)
             if week:
@@ -1019,9 +1049,10 @@ class Widget:
             auto = '开'
         except FileNotFoundError:
             auto = '关'
-        read_state = '正在刷新额度…' if 'quota' in self.busy else ('额度读取失败；可点击顶部刷新，或等下次自动更新。' if failed else '额度与公告每 10 分钟自动更新；顶部可手动刷新。')
+        read_state = '正在刷新额度…' if 'quota' in self.busy else ('额度读取失败；可点击顶部刷新，或等下次自动更新。' if failed else f'额度{self.refresh_interval_label()}更新；公告与 WorkBuddy 每 10 分钟；顶部可手动刷新。')
         if self.reset_watch:
-            read_state += ' · 等待重置：额度每 10 秒检测，变化后响铃并自动停止；公告仍每 10 分钟。'
+            read_state += (f' · 等待重置：每10秒检测，变化后响铃并恢复{next(k for k,v in QUOTA_REFRESH_INTERVALS.items() if v==self.normal_refresh_seconds)}。'
+                           if self.quota_refresh_seconds == 10 else ' · 检测到重置变化时响铃，继续按所选间隔更新。')
         if self.errors.get('quota') == 'login':
             read_state = '登录状态失效，请检查 Codex 当前账号登录后再刷新。'
         if self.markdown_error:
@@ -1182,7 +1213,7 @@ class Widget:
             self.last_start['quota'] = 0
         while not self.q.empty():
             self.apply(*self.q.get())
-        for name, interval, fn in [('quota', 10 if self.reset_watch else 600, read_quota), ('tibo', 600, read_tibo)]:
+        for name, interval, fn in [('quota', self.quota_refresh_seconds, read_quota), ('tibo', 600, read_tibo)]:
             if time.monotonic()-self.last_start[name] >= interval:
                 self.start(name, fn, reason='reset-watch' if name=='quota' and self.reset_watch else 'auto')
         if time.monotonic()-self.wb_checked >= 600:
