@@ -8,7 +8,7 @@ import tkinter as tk
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from workbuddy_usage import SnapshotStore, balance_view, changes, expiry_alerts, timestamp, validate
+from workbuddy_usage import SnapshotStore, balance_view, changes, expiry_notice, timestamp, validate
 
 
 def fixture():
@@ -68,17 +68,26 @@ class WorkBuddyTests(unittest.TestCase):
         self.assertEqual(after['past_due_snapshot'],75)
         self.assertEqual(data['total_used'],25)
 
-    def test_reminders_dedup_restart_and_cross_threshold(self):
-        data=fixture(); deadline=timestamp(data['batches'][0]['expires_at']);seen={}
-        self.assertEqual(expiry_alerts(data,deadline-8*86400,seen),[])
-        self.assertEqual(len(expiry_alerts(data,deadline-5*86400,seen)),1)
-        seen=json.loads(json.dumps(seen))
-        self.assertEqual(expiry_alerts(data,deadline-4*86400,seen),[])
-        self.assertEqual(len(expiry_alerts(data,deadline-1800,seen)),1)
-        self.assertEqual(expiry_alerts(data,deadline-1799,seen),[])
-        self.assertIn('已过',expiry_alerts(data,deadline,seen)[0])
+    def test_title_notice_only_within_72_hours_and_positive_balance(self):
+        data=fixture(); deadline=timestamp(data['batches'][0]['expires_at'])
+        self.assertEqual(expiry_notice(data,deadline-3*86400-1),'')
+        self.assertIn('75.00 积分',expiry_notice(data,deadline-3*86400))
+        self.assertIn('最近剩1小时',expiry_notice(data,deadline-3600))
+        self.assertIn('最近剩30分钟',expiry_notice(data,deadline-1800))
+        self.assertIn('快照待刷新',expiry_notice(data,deadline-1800,True))
+        self.assertEqual(expiry_notice(data,deadline),'')
+        self.assertEqual(expiry_notice(data,deadline+1),'')
         data['batches'][0]['remaining']=0
-        self.assertEqual(expiry_alerts(data,deadline,{}),[])
+        self.assertEqual(expiry_notice(data,deadline-1800),'')
+
+    def test_title_notice_sums_only_eligible_batches(self):
+        data=fixture();now=timestamp(data['batches'][0]['expires_at'])-3600
+        for offset,remaining in [(7200,25),(4*86400,900),(-1,500),(60,0)]:
+            row=copy.deepcopy(data['batches'][0]);row['remaining']=remaining
+            import datetime as dt
+            row['expires_at']=dt.datetime.fromtimestamp(now+offset,dt.timezone.utc).isoformat()
+            data['batches'].append(row)
+        self.assertIn('100.00 积分',expiry_notice(data,now))
 
     def test_markdown_write_guard(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -113,6 +122,18 @@ class WorkBuddyTests(unittest.TestCase):
                     self.assertFalse(widget.state['sections']['WorkBuddy 积分'])
                     heading.invoke();self.assertTrue(widget.state['sections']['WorkBuddy 积分'])
                     heading.invoke();self.assertFalse(widget.state['sections']['WorkBuddy 积分'])
+                    with patch.object(widget,'alert') as alert:
+                        widget.wb_display(timestamp('2026-10-29T14:21:26+08:00'))
+                        self.assertIn('75.00 积分',widget.wb_expiry_badge.cget('text'))
+                        self.assertIn('快照待刷新',widget.wb_expiry_badge.cget('text'))
+                        self.assertFalse(widget.state['sections']['WorkBuddy 积分'])
+                        self.assertEqual(widget.wb_reminder_button.cget('text'),'标题提示：开')
+                        widget.wb_toggle_reminders();widget.wb_display(timestamp('2026-10-29T14:21:26+08:00'))
+                        self.assertEqual(widget.wb_expiry_badge.cget('text'),'')
+                        widget.wb_toggle_reminders()
+                        widget.wb_display(timestamp('2026-10-30T00:00:00+08:00'))
+                        self.assertEqual(widget.wb_expiry_badge.cget('text'),'')
+                        alert.assert_not_called()
                     widget.wb_reload(str(folder/'missing.json'))
                     widget.wb_display(timestamp('2026-10-18T01:00:00+08:00'))
                     self.assertIn('保留上次快照',widget.wb_summary.cget('text'))

@@ -22,7 +22,7 @@ import io
 import wave
 from array import array
 from usage_history import UsageHistory, intervals, quota_delta
-from workbuddy_usage import SnapshotStore, balance_view, expiry_alerts, timestamp as wb_timestamp
+from workbuddy_usage import SnapshotStore, balance_view, expiry_notice, timestamp as wb_timestamp
 from workbuddy_api import CreditHistory, ApiError
 from workbuddy_client import ClientBilling
 
@@ -98,6 +98,24 @@ def five_summary(five, now):
     sec = max(0, int((five.get('resetsAt') or now)-now))
     countdown = f'{sec//3600:02}:{sec%3600//60:02}:{sec%60:02}'
     return f'5h 剩 {left:g}%   {countdown}' if sec else f'5h 上次剩 {left:g}%   待核对重置'
+
+
+def compact_summary(five, now, stale=False):
+    if not five or five.get('usedPercent') is None:
+        return '5h —\n待读取'
+    left = max(0, min(100, 100-five['usedPercent']))
+    if five_idle(five):
+        countdown = '待开始'
+    else:
+        seconds = max(0, int((five.get('resetsAt') or now)-now))
+        countdown = f'{seconds//3600:02}:{seconds%3600//60:02}:{seconds%60:02}' if seconds else '待核对'
+    return f'5h {left:g}%'+(' · 旧' if stale else '')+'\n'+countdown
+
+
+def dock_position(bounds, width, height, side, y):
+    left, top, right, bottom = bounds
+    return (left if side == 'left' else max(left, right-width),
+            min(max(top, y), max(top, bottom-height)))
 
 
 def forecast(windows, now, deadline=None):
@@ -404,9 +422,19 @@ class Widget:
         self.quota_refresh_seconds = self.normal_refresh_seconds
         self.reset_watch = self.quota_refresh_seconds < 600
         self.reset_watch_baseline = None
+        self.dock_enabled = self.state.get('dock_enabled', True)
+        self.dock_side = self.state.get('dock_side', 'right')
+        self.dock_compact = False
+        self.dock_dragging = False
+        self.dock_hover_job = None
+        self.dock_hide_job = None
         self.sound_stop = threading.Event()
         self.root.geometry(self.state.get('position', '+80+65'))
         self.build()
+        self.root.bind('<Enter>', self.dock_enter, add='+')
+        self.root.bind('<Leave>', self.dock_leave, add='+')
+        if self.dock_enabled:
+            self.dock_hide()
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.after(200, self.tick)
         if smoke:
@@ -438,11 +466,18 @@ class Widget:
                 body.pack(fill='x')
             heading.config(text=('▸ ' if visible else '▾ ') + text)
             self.persist()
-        heading = tk.Button(card, text=('▾ ' if opened else '▸ ')+text,
+        header = tk.Frame(card, bg=BG)
+        header.pack(fill='x', pady=(0, 7))
+        heading = tk.Button(header, text=('▾ ' if opened else '▸ ')+text,
                             command=toggle_section, bg=BG, fg=GREEN, activebackground=PANEL,
                             activeforeground=GREEN, anchor='w', relief='flat', bd=0,
                             cursor='hand2', font=('Microsoft YaHei UI', 14, 'bold'))
-        heading.pack(fill='x', pady=(0, 7))
+        heading.pack(side='left', fill='x', expand=True)
+        if text == 'WorkBuddy 积分':
+            self.wb_expiry_badge = self.label(header, '', 9, '#ffc66d',
+                                             wraplength=340, justify='right', anchor='e')
+            self.wb_expiry_badge.pack(side='right', padx=(8, 0))
+            self.wb_expiry_badge.bind('<Button-1>', lambda event: heading.invoke())
         line = tk.Frame(card, bg='#3a404d', height=1)
         line.pack(fill='x', pady=(0, 7))
         if opened:
@@ -471,7 +506,16 @@ class Widget:
 
     def build(self):
         self.section_controls = {}
+        self.mini = tk.Frame(self.root, bg=BG, padx=5, pady=3)
+        self.mini_label = self.label(self.mini, '5h —\n待读取', 9, GREEN, justify='center')
+        self.mini_label.pack()
+        for element in (self.mini, self.mini_label):
+            element.bind('<Button-1>', self.header_press)
+            element.bind('<B1-Motion>', self.header_motion)
+            element.bind('<ButtonRelease-1>', self.header_release)
+            element.configure(cursor='hand2')
         bar = tk.Frame(self.root, bg=BG, padx=12, pady=8)
+        self.bar = bar
         bar.pack(fill='x')
         drag = self.label(bar, '⠿ CODEX', 10, GREEN)
         drag.pack(side='left', padx=(0, 12))
@@ -490,6 +534,8 @@ class Widget:
         self.refresh_interval_menu.pack(side='left', padx=(6, 0))
         self.chevron = self.label(bar, '▾', 11, MUTED)
         self.chevron.pack(side='left', padx=(10, 0))
+        self.dock_button = self.button(bar, '贴边：开' if self.dock_enabled else '贴边：关', self.toggle_dock)
+        self.dock_button.pack(side='left', padx=(6, 0))
         for element in (bar, drag, self.main, self.chevron):
             element.bind('<Button-1>', self.header_press)
             element.bind('<B1-Motion>', self.header_motion)
@@ -548,7 +594,7 @@ class Widget:
         actions.pack(fill='x', pady=6)
         self.button(actions, '导入积分快照 JSON', self.wb_import).pack(side='left', padx=(0, 6))
         self.button(actions, '重新读取快照', self.wb_reload).pack(side='left', padx=(0, 6))
-        self.wb_reminder_button = self.button(actions, '到期提醒：开', self.wb_toggle_reminders)
+        self.wb_reminder_button = self.button(actions, '标题提示：开', self.wb_toggle_reminders)
         self.wb_reminder_button.pack(side='left')
         self.button(wb_card, '打开库内积分记录', self.wb_open_record).pack(anchor='w', pady=(0, 6))
         style = ttk.Style(self.root)
@@ -620,6 +666,7 @@ class Widget:
             self.markdown_error=type(failure).__name__
 
     def drag_start(self, e):
+        self.dock_dragging = True
         self.origin = (e.x_root-self.root.winfo_x(), e.y_root-self.root.winfo_y())
 
     def header_press(self, e):
@@ -634,6 +681,7 @@ class Widget:
             self.drag(e)
 
     def header_release(self, e):
+        self.dock_dragging = False
         distance = max(abs(e.x_root-self.header_origin[0]), abs(e.y_root-self.header_origin[1]))
         if self.header_moved or distance > 5:
             self.drag_end(e)
@@ -641,19 +689,118 @@ class Widget:
             self.toggle()
 
     def drag(self, e):
-        self.root.geometry(f'+{max(0,e.x_root-self.origin[0])}+{max(0,e.y_root-self.origin[1])}')
+        x, y = e.x_root-self.origin[0], e.y_root-self.origin[1]
+        self.root.geometry(f'{x:+d}{y:+d}')
 
     def drag_end(self, e):
+        self.dock_dragging = False
+        if self.dock_enabled:
+            left, top, right, bottom = self.work_area()
+            middle = self.root.winfo_x()+self.root.winfo_width()/2
+            self.dock_side = 'left' if middle < (left+right)/2 else 'right'
+            self.state['dock_side'] = self.dock_side
+            self.state['dock_y'] = self.root.winfo_y()
+            self.dock_layout()
         self.state['position'] = f'+{max(0,self.root.winfo_x())}+{max(0,self.root.winfo_y())}'
         self.persist()
 
     def toggle(self):
+        self.dock_show()
         self.expanded = not self.expanded
         self.chevron.config(text='▴' if self.expanded else '▾')
         if self.expanded:
             self.details_host.pack(fill='both', expand=True)
         else:
             self.details_host.pack_forget()
+        self.dock_layout()
+
+    def work_area(self):
+        try:
+            from ctypes import wintypes
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT),
+                            ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD)]
+            user = ctypes.windll.user32
+            user.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user.MonitorFromWindow.restype = wintypes.HANDLE
+            user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+            monitor = user.MonitorFromWindow(self.root.winfo_id(), 2)
+            info = MonitorInfo(); info.cbSize = ctypes.sizeof(info)
+            if user.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                r = info.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except (AttributeError, OSError):
+            pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def dock_layout(self):
+        if not self.dock_enabled or self.dock_dragging:
+            return
+        self.root.update_idletasks()
+        bounds = self.work_area()
+        width = min(self.root.winfo_reqwidth(), bounds[2]-bounds[0])
+        height = min(self.root.winfo_reqheight(), bounds[3]-bounds[1])
+        y = self.state.get('dock_y', bounds[1]+(bounds[3]-bounds[1])*2//5)
+        x, y = dock_position(bounds, width, height, self.dock_side, y)
+        self.root.geometry(f'{width}x{height}{x:+d}{y:+d}')
+
+    def dock_show(self):
+        if not self.dock_compact:
+            return
+        self.dock_compact = False
+        self.mini.pack_forget()
+        self.bar.pack(fill='x', before=self.details_host) if self.details_host.winfo_manager() else self.bar.pack(fill='x')
+        self.dock_layout()
+
+    def dock_hide(self):
+        self.dock_hide_job = None
+        if not self.dock_enabled or self.expanded or self.dock_dragging:
+            return
+        self.dock_compact = True
+        self.bar.pack_forget()
+        self.mini.pack()
+        self.dock_layout()
+
+    def dock_enter(self, event=None):
+        if self.dock_hide_job:
+            self.root.after_cancel(self.dock_hide_job); self.dock_hide_job = None
+        if self.dock_enabled and self.dock_compact and not self.dock_hover_job:
+            self.dock_hover_job = self.root.after(180, self.dock_hover)
+
+    def dock_hover(self):
+        self.dock_hover_job = None
+        if not self.dock_dragging and self.pointer_inside():
+            self.dock_show()
+
+    def pointer_inside(self):
+        x, y = self.root.winfo_pointerxy()
+        return (self.root.winfo_x() <= x < self.root.winfo_x()+self.root.winfo_width()
+                and self.root.winfo_y() <= y < self.root.winfo_y()+self.root.winfo_height())
+
+    def dock_leave(self, event=None):
+        if self.dock_enabled and not self.dock_hide_job:
+            self.dock_hide_job = self.root.after(900, self.dock_maybe_hide)
+
+    def dock_maybe_hide(self):
+        self.dock_hide_job = None
+        if self.closed.is_set():
+            return
+        if not self.pointer_inside() and not self.root.grab_current():
+            self.dock_hide()
+        elif not self.expanded:
+            self.dock_hide_job = self.root.after(900, self.dock_maybe_hide)
+
+    def toggle_dock(self):
+        self.dock_show()
+        self.dock_enabled = not self.dock_enabled
+        self.state['dock_enabled'] = self.dock_enabled
+        self.dock_button.config(text='贴边：开' if self.dock_enabled else '贴边：关')
+        self.persist()
+        if self.dock_enabled:
+            self.dock_layout()
+            self.dock_leave()
+        else:
+            self.root.geometry('')
 
     def mute(self):
         self.state['muted'] = not self.state.get('muted', False)
@@ -763,7 +910,6 @@ class Widget:
     def refresh_interval_label(self):
         return next(label for label, seconds in QUOTA_REFRESH_INTERVALS.items() if seconds == self.quota_refresh_seconds)
 
-
     def set_refresh_interval(self, label):
         if label not in QUOTA_REFRESH_INTERVALS:
             return
@@ -857,7 +1003,12 @@ class Widget:
         self.wb_show_live(now)
         live_snapshot = (self.wb_live or {}).get('snapshot')
         data = live_snapshot or (self.wb_store.latest if self.wb_store else None)
-        self.wb_reminder_button.config(text='到期提醒：' + ('开' if self.state.get('workbuddy_reminders', True) else '关'))
+        self.wb_reminder_button.config(text='标题提示：' + ('开' if self.state.get('workbuddy_reminders', True) else '关'))
+        batches_at = (self.wb_live or {}).get('batches_at', (self.wb_live or {}).get('at', 0))
+        stale = (not live_snapshot or now-batches_at > 1200 or bool((self.wb_live or {}).get('detail_error'))
+                 or bool(self.errors.get('workbuddy-live') or self.errors.get('workbuddy-auth')))
+        badge = expiry_notice(data, now, stale) if data and self.state.get('workbuddy_reminders', True) else ''
+        self.wb_expiry_badge.config(text=badge)
         if not data:
             self.wb_summary.config(text=self.wb_error or '尚无快照；余额未知。')
             return
@@ -917,15 +1068,6 @@ class Widget:
             rates = reference.get('model_display_rates', [])
             self.wb_models_detail.config(text='采集 ' + reference['captured_date'] + ' 的菜单截图，非当前计费公式。\n' +
                 '\n'.join(f'{r["name"]}：{r["display_multiplier"]:g}×  {r.get("label", "")}' for r in rates))
-        if self.state.get('workbuddy_reminders', True):
-            seen = self.state.setdefault('workbuddy_expiry_seen', {})
-            before = json.dumps(seen, sort_keys=True)
-            messages = expiry_alerts(data, now, seen)
-            if messages:
-                self.alert('\n\n'.join(messages[:4]) + (f'\n另有 {len(messages)-4} 笔，请展开 WorkBuddy 查看。' if len(messages)>4 else ''))
-            if before != json.dumps(seen, sort_keys=True):
-                self.persist()
-
     def apply(self, name, data, error):
         self.busy.discard(name)
         if error:
@@ -996,6 +1138,8 @@ class Widget:
                       'tibo_at': self.tibo.get('at'), 'errors': self.errors,
                       'markdown_error': self.markdown_error, 'markdown_at': self.markdown_at,
                       'history_error': self.history_error,
+                      'dock_compact': self.dock_compact,
+                      'widget_size': [self.root.winfo_width(), self.root.winfo_height()],
                       'pid': os.getpid(), 'running': True})
 
     def display(self):
@@ -1004,6 +1148,11 @@ class Widget:
         week = next((w for w in windows if w.get('windowDurationMins') == 10080), None)
         now = time.time()
         stale = now-self.quota.get('at', 0) > max(1200, self.quota_refresh_seconds*2)
+        mini_text = compact_summary(five, now, stale)
+        if mini_text != self.mini_label.cget('text'):
+            self.mini_label.config(text=mini_text, fg=MUTED if stale else GREEN)
+            if self.dock_compact:
+                self.dock_layout()
         failed = 'quota' in self.errors
         self.refresh_button.config(text='刷新中…' if 'quota' in self.busy else '刷新',
                                    state='disabled' if 'quota' in self.busy else 'normal')
@@ -1058,6 +1207,8 @@ class Widget:
         if self.markdown_error:
             read_state += ' · 库内 Markdown 导出失败：'+self.markdown_error
         self.footer.config(text=f"额度更新 {stamp(self.quota.get('at'))} · 公告检查 {stamp(self.tibo.get('at'))}\n{read_state}\n剩余 20% / 10% / 0% 时提醒 · 声音{'关闭' if self.state.get('muted') else '开启'} · 登录自启{auto}\n拖动正文或顶部额度栏移动 · 点击分区标题收起详情")
+        if self.dock_enabled and not self.dock_compact:
+            self.root.after_idle(self.dock_layout)
 
     def draw_forecast(self, f, now, deadline, stale, notice=None):
         c = self.timeline

@@ -179,20 +179,18 @@ def balance_view(data, now):
             'past_due_snapshot': sum(r['remaining'] for r in expired)}
 
 
-def expiry_alerts(data, now, seen):
-    messages = []
-    for row in data['batches']:
-        if row['remaining'] <= 0:
-            continue
-        seconds = timestamp(row['expires_at'])-now
-        passed = [limit for limit in (7*86400, 3*86400, 86400, 3600, 0) if seconds <= limit]
-        if not passed:
-            continue
-        key = batch_key(row)
-        previous = seen.get(key, [])
-        if min(passed) not in previous:
-            state = '预计到期时间已过' if seconds <= 0 else '即将到期'
-            messages.append(f'WorkBuddy {state}：{row["expires_at"][:19].replace("T", " ")}\n'
-                            f'快照当时剩 {row["remaining"]:g} 积分；采集 {data["captured_date"]}，当前余额待核对。')
-        seen[key] = sorted(set(previous + passed))
-    return messages
+def expiry_notice(data, now, stale=False):
+    """Quiet title badge for positive balances expiring in the next 72 hours."""
+    import math
+    from decimal import Decimal
+    due = [(timestamp(r['expires_at'])-now, Decimal(str(r['remaining'])))
+           for r in data['batches'] if r['remaining'] > 0
+           and 0 < timestamp(r['expires_at'])-now <= 3*86400]
+    if not due:
+        return ''
+    seconds = min(t for t, _ in due)
+    remaining = sum((amount for _, amount in due), Decimal(0))
+    amount = f'{remaining:,.2f}' if remaining >= Decimal('0.01') else '<0.01'
+    duration = f'{math.ceil(seconds/3600)}小时' if seconds >= 3600 else f'{math.ceil(seconds/60)}分钟'
+    return (f'3日内到期 {amount} 积分 · 最近剩{duration}' +
+            (' · 快照待刷新' if stale else ''))
