@@ -8,6 +8,26 @@ import usage_widget as m
 
 
 class DockTests(unittest.TestCase):
+    def test_native_topmost_restores_flag_without_changing_focus(self):
+        import ctypes
+        from ctypes import wintypes
+        import tkinter as tk
+        root=tk.Tk();root.overrideredirect(True)
+        root.geometry('80x45+30+30');root.update()
+        try:
+            user=ctypes.windll.user32
+            user.GetAncestor.argtypes=[wintypes.HWND,wintypes.UINT]
+            user.GetAncestor.restype=wintypes.HWND
+            user.GetForegroundWindow.restype=wintypes.HWND
+            self.assertTrue(m.promote_topmost(root.winfo_id()))
+            hwnd=user.GetAncestor(root.winfo_id(),2)
+            user.SetWindowPos(hwnd,wintypes.HWND(-2),0,0,0,0,0x0013)
+            self.assertFalse(user.GetWindowLongW(hwnd,-20)&8)
+            before=user.GetForegroundWindow()
+            self.assertTrue(m.promote_topmost(root.winfo_id()))
+            self.assertEqual(user.GetForegroundWindow(),before)
+        finally:root.destroy()
+
     def test_compact_countdown_idle_stale_and_missing(self):
         five={'windowDurationMins':300,'usedPercent':63,'resetsAt':10000}
         self.assertEqual(m.compact_summary(five,6400),'5h 37%\n01:00:00')

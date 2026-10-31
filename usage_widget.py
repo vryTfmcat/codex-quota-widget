@@ -118,6 +118,24 @@ def dock_position(bounds, width, height, side, y):
             min(max(top, y), max(top, bottom-height)))
 
 
+def promote_topmost(tk_handle):
+    """Promote Tk's actual Windows wrapper without activating or moving it."""
+    from ctypes import wintypes
+    user = ctypes.windll.user32
+    user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user.GetAncestor.restype = wintypes.HWND
+    user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user.SetWindowPos.restype = wintypes.BOOL
+    user.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user.GetWindowLongW.restype = ctypes.c_long
+    hwnd = user.GetAncestor(tk_handle, 2) or tk_handle  # GA_ROOT, not Tk's child HWND.
+    flags = 0x0001 | 0x0002 | 0x0010 | 0x0200  # NOSIZE, NOMOVE, NOACTIVATE, NOOWNERZORDER.
+    if not user.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags):
+        return False
+    return bool(user.GetWindowLongW(hwnd, -20) & 0x0008)  # WS_EX_TOPMOST
+
+
 def forecast(windows, now, deadline=None):
     five = next((w for w in windows if w.get('windowDurationMins') == 300), None)
     week = next((w for w in windows if w.get('windowDurationMins') == 10080), None)
@@ -428,13 +446,17 @@ class Widget:
         self.dock_dragging = False
         self.dock_hover_job = None
         self.dock_hide_job = None
+        self.last_topmost = 0
+        self.topmost_ok = None
         self.sound_stop = threading.Event()
         self.root.geometry(self.state.get('position', '+80+65'))
         self.build()
         self.root.bind('<Enter>', self.dock_enter, add='+')
         self.root.bind('<Leave>', self.dock_leave, add='+')
+        self.root.bind('<Map>', lambda event: self.root.after_idle(self.ensure_topmost), add='+')
         if self.dock_enabled:
             self.dock_hide()
+        self.root.after_idle(self.ensure_topmost)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.after(200, self.tick)
         if smoke:
@@ -743,6 +765,21 @@ class Widget:
         y = self.state.get('dock_y', bounds[1]+(bounds[3]-bounds[1])*2//5)
         x, y = dock_position(bounds, width, height, self.dock_side, y)
         self.root.geometry(f'{width}x{height}{x:+d}{y:+d}')
+        self.ensure_topmost()
+
+
+    def ensure_topmost(self):
+        if self.closed.is_set() or not self.root.winfo_viewable():
+            return
+        # Do not cover this app's alerts or interfere with an open dropdown grab.
+        if self.root.grab_current() or any(isinstance(w, tk.Toplevel) and w.winfo_viewable()
+                                           for w in self.root.winfo_children()):
+            return
+        self.last_topmost = time.monotonic()
+        try:
+            self.topmost_ok = promote_topmost(self.root.winfo_id())
+        except (AttributeError, OSError):
+            self.topmost_ok = False
 
     def dock_show(self):
         if not self.dock_compact:
@@ -1140,6 +1177,7 @@ class Widget:
                       'history_error': self.history_error,
                       'dock_compact': self.dock_compact,
                       'widget_size': [self.root.winfo_width(), self.root.winfo_height()],
+                      'native_topmost': self.topmost_ok,
                       'pid': os.getpid(), 'running': True})
 
     def display(self):
@@ -1358,6 +1396,8 @@ class Widget:
     def tick(self):
         if self.closed.is_set():
             return
+        if time.monotonic()-self.last_topmost >= 2:
+            self.ensure_topmost()
         for msg in due_alerts(time.time(), self.state):
             self.alert(msg)
             self.persist()
